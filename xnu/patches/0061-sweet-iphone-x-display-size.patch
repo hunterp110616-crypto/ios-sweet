@@ -104,9 +104,9 @@
 +	int native = 0;
 +	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
 +	fLogicalW = native ? 1080 : 1125;
-+	fLogicalH = native ? 2400 : 2436;
++	fLogicalH = native ? 2340 : 2436;
 +	fOffX = (fLogicalW - 1080) / 2;
-+	fOffY = (fLogicalH - 2400) / 2;
++	fOffY = (fLogicalH - 2340) / 2;
  	/* The digitizer covers the main display (backboardd maps it 1:1). */
  	setProperty("DisplayIntegrated", kOSBooleanTrue);
  	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */

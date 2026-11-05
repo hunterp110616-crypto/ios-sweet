@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel]
 """
 import hashlib, os, struct, sys
 
@@ -38,6 +38,11 @@ VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
+# Pixel 5 (redfin, SM7250). RAM bank 0x1_8000_0000 + 4 GiB has no firmware carve-outs; ABL's continuous
+# splash framebuffer is 0xa0000000 (cont_splash_region, 0x2300000 bytes), panel 1080x2340.
+PIXEL_HIGH_PHYS_BASE, PIXEL_HIGH_MEM_SIZE = 0x180000000, 0xfcc00000
+PIXEL_FB, PIXEL_FB_SIZE = 0xa0000000, 0x2300000
+PIXEL_FB_W, PIXEL_FB_H = 1080, 2340
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -47,7 +52,7 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 # an Apple artifact (kept out of git): extract it from the IPSW with
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
-D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+D22AP_ADT = os.environ.get('D22AP_ADT') or os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
 
 def d22ap_product(path=D22AP_ADT):
@@ -74,9 +79,12 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, pixel=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    if pixel:
+        phys_base, mem_size = PIXEL_HIGH_PHYS_BASE, PIXEL_HIGH_MEM_SIZE
+    fb, fb_size, fb_w, fb_h = (PIXEL_FB, PIXEL_FB_SIZE, PIXEL_FB_W, PIXEL_FB_H) if pixel else (FB, FB_SIZE, FB_W, FB_H)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
@@ -191,10 +199,10 @@ def build(seed=None, qemu=False, highmem=False):
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
+        ('reg', u64(fb, fb_size)),
+        ('width', u32(fb_w)),
+        ('height', u32(fb_h)),
+        ('stride', u32(fb_w * 4)),
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
@@ -231,7 +239,7 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + (cstr('google,redfin') + cstr('qcom,sm7250') if pixel else cstr('qcom,sm7150')) + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -242,7 +250,7 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, pixel='--pixel' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
