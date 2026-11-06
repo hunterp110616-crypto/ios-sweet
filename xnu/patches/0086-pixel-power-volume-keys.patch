@@ -1,0 +1,29 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -21,7 +21,7 @@
+ #define KEYS_OBS_PA      0x0e600000u
+ #define KEYS_CNFG_PA     0x0c40a000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
++#define KEYS_GPIO_RT     0xc410u /* Pixel 5: PM8150L gpio5 (volume up), status register */
+ #define KEYS_NO_APID     0xffffu
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+@@ -152,13 +152,13 @@
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	keys_gpio_apid = keys_find_apid(0x4c4, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
++	bool mok = keys_read(keys_gpio_apid, 0xc440, &mode);
++	bool eok = keys_read(keys_gpio_apid, 0xc446, &en);
++	bool sok = keys_read(keys_gpio_apid, 0xc405, &subtype);
+ 	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+ 	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
