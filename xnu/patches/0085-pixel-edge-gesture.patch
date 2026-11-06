@@ -1,0 +1,26 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -615,8 +615,10 @@
+ 		return;
+ 	}
+ 	if (!was && down) {
++		/* The Pixel panel is 1080x2340 (the original phone's was 2400 tall), and a finger sliding in
++		 * from the bottom bezel only registers a little way inside, so the bottom zone is wider. */
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		    y < SWEET_TOUCH_EDGE_PX || y > 2339 - 100;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+--- a/bsd/dev/pixel_touch.c
++++ b/bsd/dev/pixel_touch.c
+@@ -540,7 +540,8 @@
+ 	if (y > 2339) {
+ 		y = 2339;
+ 	}
+-	bool finger = ttype == 0 || ttype == 3 || ttype == 6;	/* normal, glove, wet */
++	/* normal, glove, wet; "grip" (10) near the bottom is a finger sliding in from the bezel */
++	bool finger = ttype == 0 || ttype == 3 || ttype == 6 || (ttype == 10 && y > 2200);
+ 	if (action == 3 || !finger) {
+ 		if (P.active & bit) {
+ 			sweet_hid_touch((int)id, 0, P.x[id], P.y[id]);
