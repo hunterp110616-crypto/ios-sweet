@@ -1,0 +1,719 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/pixel_touch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void pixel_touch_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	pixel_touch_init();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/pixel_touch.c
+@@ -0,0 +1,688 @@
++/*
++ * Pixel 5 (redfin / SM7250) touchscreen: Samsung S6SY79x "sec,sec_ts" on GENI SE0 as an SPI master.
++ * Polled FIFO-mode driver, verified on the real phone with the bare-metal shim probe (touchprobe.c).
++ *
++ *   SE0 0x880000 (wrapper0), mode 3 (cpol+cpha), CS0, MISO/MOSI/SCLK/CS = gpio42..45 (func qup00, EAST tile),
++ *   reset gpio8, irq gpio9 (WEST tile, level low), bus switch gpio35 (drive low = AP is master),
++ *   avdd = pm8150_l17 ("ldoa17" in cmd-db) 3.304 V through the apps RSC (DRV2) ACTIVE TCS.
++ * Protocol is Google's sec_ts SPI framing (AA sync, checksum, 4-byte padded transfers).
++ * Boot args: pixeltouch=0 disables it, sweettouchdelay=N waits N seconds (default 20) before touching hardware.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void pixel_touch_init(void);
++
++#define PT_GCC_PA	0x00100000u
++#define PT_SE0_PA	0x00880000u
++#define PT_TLMM_W_PA	0x0f500000u	/* WEST tile: gpio8, gpio9 */
++#define PT_TLMM_E_PA	0x0f900000u	/* EAST tile: gpio35, gpio42..45 */
++#define PT_RSC_PA	0x18220000u
++#define PT_TCS_PA	0x18220d00u
++#define PT_TCS_SIZE	0x3000u
++#define PT_DB_PA	0x80860000u
++#define PT_DB_SIZE	0x20000u
++
++#define PT_VOTE		0x52008u
++#define PT_MAX		10u
++
++/* GENI SE registers */
++#define SE_STATUS	0x040u
++#define SE_MCLK		0x048u
++#define SE_FW		0x068u
++#define SE_CLK_SEL	0x07cu
++#define SE_DMA		0x258u
++#define SE_TX_LEN	0x26cu
++#define SE_RX_LEN	0x270u
++#define SE_DELAYS	0x278u
++#define SE_CMD		0x600u
++#define SE_CTRL		0x604u
++#define SE_IRQ		0x610u
++#define SE_IRQ_EN	0x614u
++#define SE_IRQ_CLR	0x618u
++#define SE_TX		0x700u
++#define SE_RX		0x780u
++#define SE_TX_COUNT	0x800u
++#define SE_RX_COUNT	0x804u
++#define SE_TX_WM	0x80cu
++#define SE_HW_TX	0xe24u
++#define SE_HW_RX	0xe28u
++#define SE_DONE		(1u << 0)
++#define SE_ERRORS	(0x0eu | (3u << 24) | (3u << 28))
++#define SE_PACK0	0x0007f8feu
++#define SE_PACK1	0x000ffefeu
++
++static struct {
++	vm_offset_t gcc, se, gw, ge, rsc, tcs, db;
++	bool started, dead;
++	unsigned rh_ncpt, hwtx, hwrx;
++	uint32_t active;
++	int x[PT_MAX], y[PT_MAX];
++	unsigned spi_ok, spi_fail, nevt, npress;
++	uint8_t tx[160], rx[200];
++} P;
++static int pt_sleep_chan;
++
++static uint32_t
++pt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++pt_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&pt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- clocks ---- */
++static bool
++pt_clocks(void)
++{
++	uint32_t vote = pt_rd(P.gcc, PT_VOTE);
++	/* wrapper0 m_ahb(6) s_ahb(7) core(8) core_2x(9) SE0 clock(10) */
++	pt_wr(P.gcc, PT_VOTE, vote | (0x1fu << 6));
++	uint32_t cfg = pt_rd(P.gcc, 0x17014u);
++	printf("PIXEL TOUCH: gcc vote %#x -> %#x rcg cfg=%#x\n", vote, pt_rd(P.gcc, PT_VOTE), cfg);
++	/* S0 RCG: XO source, divider 1 (19.2 MHz) */
++	cfg &= ~(0x371fu | (1u << 20));
++	pt_wr(P.gcc, 0x17014u, cfg);
++	pt_wr(P.gcc, 0x17010u, pt_rd(P.gcc, 0x17010u) | 1u);
++	for (unsigned i = 0; i < 5000 && (pt_rd(P.gcc, 0x17010u) & 1u); i++) {
++		delay(1);
++	}
++	/* branch halt bits; 0x17008 (s_ahb) is hardware gated so CLK_OFF there is normal */
++	static const uint32_t br[5] = {0x17004u, 0x17008u, 0x23000u, 0x23008u, 0x1700cu};
++	bool ok = true;
++	for (unsigned i = 0; i < 5; i++) {
++		for (unsigned w = 0; i != 1 && w < 5000 && (pt_rd(P.gcc, br[i]) & (1u << 31)); w++) {
++			delay(1);
++		}
++		uint32_t v = pt_rd(P.gcc, br[i]);
++		if (i != 1 && (v & (1u << 31))) {
++			ok = false;
++		}
++	}
++	printf("PIXEL TOUCH: clocks %s rcg=%#x\n", ok ? "ok" : "HALTED", pt_rd(P.gcc, 0x17010u));
++	return ok;
++}
++
++/* ---- gpio ---- */
++static void
++pt_gpio(vm_offset_t base, uint32_t off, unsigned func, unsigned pull, unsigned drive, bool oe, bool high)
++{
++	if (oe) {
++		pt_wr(base, off + 4u, (pt_rd(base, off + 4u) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t c = pt_rd(base, off) & ~0x3ffu;
++	c |= (func << 2) | pull | (drive << 6) | (oe ? 0x200u : 0u);
++	pt_wr(base, off, c);
++}
++
++/* ---- RPMh (apps RSC DRV2, ACTIVE TCS); same transaction as ios-sweet's sweet_rpmh.c ---- */
++#define RH_ACTIVE_N	2u
++#define RH_TCS_STRIDE	0x2a0u
++#define RH_CMD_STRIDE	0x14u
++#define RH_IRQ_EN	0x00u
++#define RH_IRQ_STATUS	0x04u
++#define RH_IRQ_CLEAR	0x08u
++#define RH_WAIT		0x10u
++#define RH_CONTROL	0x14u
++#define RH_STATUS	0x18u
++#define RH_ENABLE	0x1cu
++#define RH_MSGID	0x30u
++#define RH_ADDR		0x34u
++#define RH_DATA		0x38u
++#define RH_CMD_STATUS	0x3cu
++#define RH_AMC_EN	(1u << 16)
++#define RH_TRIGGER	(1u << 24)
++#define RH_ISSUED	(1u << 8)
++#define RH_COMPLETE	(1u << 16)
++#define RH_WRITE_ACK	(8u | (1u << 8) | (1u << 16))
++#define RH_DB_MAGIC	0x0c0330dbu
++#define RH_DB_HEADER	144u
++#define RH_DB_ENTRY	24u
++#define RH_VRM		4u
++
++static bool
++rh_sync(uint32_t off, uint32_t value)
++{
++	pt_wr(P.tcs, off, value);
++	for (unsigned i = 0; i < 1000; i++) {
++		if (pt_rd(P.tcs, off) == value) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static uint16_t
++rh_db16(uint32_t off)
++{
++	uint32_t v = pt_rd(P.db, off & ~3u);
++	return (uint16_t)(v >> (8u * (off & 3u)));
++}
++
++static int
++rh_lookup(const char *res, uint32_t *address)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) || entries + count * RH_DB_ENTRY > PT_DB_SIZE) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; j++) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (pt_rd(P.db, e) != key[0] || pt_rd(P.db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = pt_rd(P.db, e + 16);
++			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u)) {
++				return EINVAL;
++			}
++			*address = addr;
++			matches++;
++		}
++	}
++	return matches == 1 ? 0 : ENODEV;
++}
++
++static uint32_t
++tcs_rd(uint32_t off)
++{
++	return pt_rd(P.tcs, off);
++}
++
++static bool
++rh_free(unsigned t)
++{
++	uint32_t b = t * RH_TCS_STRIDE;
++	return tcs_rd(b + RH_STATUS) != 0 && tcs_rd(b + RH_STATUS) != 0xffffffffu &&
++	       tcs_rd(b + RH_CONTROL) == 0 && tcs_rd(b + RH_ENABLE) == 0 && tcs_rd(b + RH_WAIT) == 0 &&
++	       !(tcs_rd(RH_IRQ_STATUS) & (1u << t));
++}
++
++static int
++rh_vote(uint32_t address, unsigned mv)
++{
++	int chosen = -1;
++	for (unsigned t = 0; t < RH_ACTIVE_N; t++) {
++		uint32_t b = t * RH_TCS_STRIDE, en = tcs_rd(b + RH_ENABLE);
++		if (en & ~((1u << P.rh_ncpt) - 1u)) {
++			return EIO;
++		}
++		for (unsigned c = 0; c < P.rh_ncpt; c++) {
++			if ((en & (1u << c)) && (tcs_rd(b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
++				return EBUSY;
++			}
++		}
++		if (chosen < 0 && rh_free(t)) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		return EBUSY;
++	}
++	unsigned t = (unsigned)chosen;
++	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t, irq_en = tcs_rd(RH_IRQ_EN);
++	if (irq_en == 0xffffffffu || !rh_free(t) || !rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
++		return EIO;
++	}
++	static const uint32_t offs[3] = {0, 8, 4};
++	const uint32_t vals[3] = {mv, 7, 1};	/* voltage, HPM, enable */
++	for (unsigned c = 0; c < 3; c++) {
++		uint32_t cmd = b + c * RH_CMD_STRIDE;
++		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) || !rh_sync(cmd + RH_ADDR, address + offs[c]) ||
++		    !rh_sync(cmd + RH_DATA, vals[c])) {
++			return EIO;
++		}
++	}
++	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) || !rh_sync(b + RH_CONTROL, 0) ||
++	    !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
++		return EIO;
++	}
++	pt_wr(P.tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++	bool done = false, progress = false;
++	for (unsigned us = 0; us < 200000; us++) {
++		uint32_t irq = tcs_rd(RH_IRQ_STATUS), idle = tcs_rd(b + RH_STATUS);
++		bool complete = true;
++		for (unsigned c = 0; c < 3; c++) {
++			uint32_t st = tcs_rd(b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
++			complete = complete && st != 0xffffffffu && (st & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++		}
++		progress = progress || idle == 0 || !complete;
++		if (idle && idle != 0xffffffffu && irq != 0xffffffffu && ((irq & bit) || progress) && complete) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done) {
++		return ETIMEDOUT;
++	}
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_ENABLE, 0) ||
++	    !rh_sync(b + RH_WAIT, 0)) {
++		return EIO;
++	}
++	pt_wr(P.tcs, RH_IRQ_CLEAR, bit);
++	if ((tcs_rd(RH_IRQ_STATUS) & bit) || !rh_sync(RH_IRQ_EN, (tcs_rd(RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++pt_power_on(void)
++{
++	uint32_t id = pt_rd(P.rsc, 0), cfg = pt_rd(P.rsc, 0x0c);
++	unsigned major = (id >> 16) & 0xffu, count = (cfg >> 12) & 0x3fu;
++	P.rh_ncpt = (cfg >> 27) & 0x1fu;
++	printf("PIXEL TOUCH: rsc id=%#x cfg=%#x tcs=%u ncpt=%u\n", id, cfg, count, P.rh_ncpt);
++	if ((major != 1 && major != 2) || cfg == 0xffffffffu || count < 8 || P.rh_ncpt < 3 || P.rh_ncpt > 16) {
++		return ENODEV;
++	}
++	if (pt_rd(P.db, 4) != RH_DB_MAGIC) {
++		printf("PIXEL TOUCH: cmd-db magic %#x\n", pt_rd(P.db, 4));
++		return EINVAL;
++	}
++	uint32_t addr = 0;
++	int e = rh_lookup("ldoa17", &addr);
++	if (e) {
++		printf("PIXEL TOUCH: ldoa17 lookup failed %d\n", e);
++		return e;
++	}
++	e = rh_vote(addr, 3304);
++	printf("PIXEL TOUCH: ldoa17 addr=%#x vote -> %d\n", addr, e);
++	return e;
++}
++
++/* ---- GENI SPI master ---- */
++static void
++pt_se_init(void)
++{
++	P.hwtx = pt_rd(P.se, SE_HW_TX);
++	P.hwrx = pt_rd(P.se, SE_HW_RX);
++	printf("PIXEL TOUCH: se0 fw=%#x iff=%#x tx=%#x rx=%#x st=%#x\n", pt_rd(P.se, SE_FW), pt_rd(P.se, 0x64),
++	    P.hwtx, P.hwrx, pt_rd(P.se, SE_STATUS));
++	pt_wr(P.se, 0xe18, 0);		/* no GSI events: FIFO interface */
++	pt_wr(P.se, 0xe1c, 0);
++	pt_wr(P.se, 0x644, 0);
++	pt_wr(P.se, SE_IRQ_CLR, 0xffffffffu);
++	pt_wr(P.se, 0x648, 0xffffffffu);
++	pt_wr(P.se, SE_DMA, 0);
++	pt_wr(P.se, 0x28, pt_rd(P.se, 0x28) | 0x7fu);
++	pt_wr(P.se, 0xe30, pt_rd(P.se, 0xe30) | 0x0fu);
++	pt_wr(P.se, 0x24, 0x7f);
++	pt_wr(P.se, 0x20, 1);
++	pt_wr(P.se, SE_CLK_SEL, 0);
++	pt_wr(P.se, SE_MCLK, (2u << 4) | 1u);	/* 19.2 MHz / 2 */
++	pt_wr(P.se, 0x22c, 0);			/* loopback off */
++	pt_wr(P.se, 0x250, 0);			/* CS0 */
++	pt_wr(P.se, 0x224, 1);			/* CPHA */
++	pt_wr(P.se, 0x230, 4);			/* CPOL */
++	pt_wr(P.se, 0x24c, 0);
++	pt_wr(P.se, 0x25c, 0);
++	pt_wr(P.se, 0x274, 0);
++	pt_wr(P.se, SE_DELAYS, 0);
++	pt_wr(P.se, 0x268, 8 - 4);		/* 8-bit words */
++	pt_wr(P.se, 0x254, 0);
++	pt_wr(P.se, 0x260, SE_PACK0);
++	pt_wr(P.se, 0x264, SE_PACK1);
++	pt_wr(P.se, 0x284, SE_PACK0);
++	pt_wr(P.se, 0x288, SE_PACK1);
++	pt_wr(P.se, SE_TX_WM, 0);
++	pt_wr(P.se, 0x810, 0);
++	unsigned rxd = (P.hwrx >> 16) & 0x3fu;
++	pt_wr(P.se, 0x814, rxd ? rxd - 1u : 0u);
++	pt_wr(P.se, SE_IRQ_EN, 0xffffffffu);
++}
++
++/* one TX-only or RX-only message, CS asserted for its duration */
++static int
++pt_spi(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr)
++{
++	unsigned sent = 0, got = 0, depth = (P.hwtx >> 16) & 0x3fu;
++	if (!depth) {
++		depth = 16;
++	}
++	for (unsigned w = 0; (pt_rd(P.se, SE_STATUS) & 1u) && w < 5000; w++) {
++		delay(1);
++	}
++	if (pt_rd(P.se, SE_STATUS) & 1u) {
++		return EBUSY;
++	}
++	pt_wr(P.se, SE_IRQ_CLR, 0xffffffffu);
++	pt_wr(P.se, SE_TX_WM, nt ? 1u : 0u);
++	pt_wr(P.se, nt ? SE_TX_LEN : SE_RX_LEN, nt ? nt : nr);
++	pt_wr(P.se, SE_CMD, (nt ? 1u : 2u) << 27);
++	for (unsigned i = 0; i < 100000; i++) {
++		uint32_t irq = pt_rd(P.se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			pt_wr(P.se, SE_CTRL, 2);
++			delay(200);
++			pt_wr(P.se, SE_IRQ_CLR, 0xffffffffu);
++			return EIO;
++		}
++		while (nt && sent < nt && (pt_rd(P.se, SE_TX_COUNT) & 0xfffffffu) < depth) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < 4 && sent + j < nt; j++) {
++				word |= (uint32_t)tx[sent + j] << (8u * j);
++			}
++			pt_wr(P.se, SE_TX, word);
++			sent += 4;
++			if (sent >= nt) {
++				pt_wr(P.se, SE_TX_WM, 0);
++			}
++		}
++		unsigned cnt = pt_rd(P.se, SE_RX_COUNT) & 0x1ffffffu;
++		while (cnt-- && cnt < 64) {
++			uint32_t word = pt_rd(P.se, SE_RX);
++			for (unsigned j = 0; j < 4 && got < nr; j++) {
++				rx[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			cnt = pt_rd(P.se, SE_RX_COUNT) & 0x1ffffffu;
++			while (cnt-- && cnt < 64) {
++				uint32_t word = pt_rd(P.se, SE_RX);
++				for (unsigned j = 0; j < 4 && got < nr; j++) {
++					rx[got++] = (uint8_t)(word >> (8u * j));
++				}
++			}
++			pt_wr(P.se, SE_IRQ_CLR, irq);
++			return (got >= nr || !nr) ? 0 : EIO;
++		}
++		delay(1);
++	}
++	pt_wr(P.se, SE_CTRL, 2);
++	delay(200);
++	pt_wr(P.se, SE_IRQ_CLR, 0xffffffffu);
++	return ETIMEDOUT;
++}
++
++/* ---- sec_ts register access ---- */
++static int
++sec_read(uint8_t reg, uint8_t *data, unsigned len)
++{
++	uint8_t cs = 0;
++	unsigned i;
++	P.tx[0] = 0xAA;
++	P.tx[1] = 0;
++	P.tx[2] = 1;
++	P.tx[3] = (uint8_t)(len >> 8);
++	P.tx[4] = (uint8_t)len;
++	P.tx[5] = reg;
++	for (i = 0; i < 6; i++) {
++		cs = (uint8_t)(cs + P.tx[i]);
++	}
++	P.tx[6] = cs;
++	P.tx[7] = 0;
++	int e = pt_spi(P.tx, 8, NULL, 0);
++	if (e) {
++		P.spi_fail++;
++		return e;
++	}
++	delay((reg == 0x61 || reg == 0x60) ? 500 : 100);
++	unsigned n = (len + 7 + 1 + 3) & ~3u;
++	if (n > sizeof(P.rx)) {
++		return EINVAL;
++	}
++	e = pt_spi(NULL, 0, P.rx, n);
++	if (e) {
++		P.spi_fail++;
++		return e;
++	}
++	cs = 0;
++	for (i = 0; i < 7 + len; i++) {
++		cs = (uint8_t)(cs + P.rx[i]);
++	}
++	if (P.rx[0] != 0xAA || P.rx[5] != reg || P.rx[7 + len] != cs) {
++		P.spi_fail++;
++		return EIO;
++	}
++	for (i = 0; i < len; i++) {
++		data[i] = P.rx[7 + i];
++	}
++	P.spi_ok++;
++	return 0;
++}
++
++static int
++sec_write(uint8_t reg, const uint8_t *data, unsigned len)
++{
++	uint8_t cs = 0;
++	unsigned i, n;
++	P.tx[0] = 0xAA;
++	P.tx[1] = (uint8_t)((len + 1) >> 8);
++	P.tx[2] = (uint8_t)(len + 1);
++	P.tx[3] = 0;
++	P.tx[4] = 0;
++	P.tx[5] = reg;
++	for (i = 0; i < len; i++) {
++		P.tx[6 + i] = data[i];
++	}
++	n = 6 + len;
++	for (i = 0; i < n; i++) {
++		cs = (uint8_t)(cs + P.tx[i]);
++	}
++	P.tx[n++] = cs;
++	P.tx[n] = P.tx[n + 1] = P.tx[n + 2] = 0;
++	n = (n + 3) & ~3u;
++	int e = pt_spi(P.tx, n, NULL, 0);
++	if (e) {
++		P.spi_fail++;
++	}
++	return e;
++}
++
++/* ---- events -> iOS HID ---- */
++static void
++pt_release_all(void)
++{
++	for (unsigned id = 0; id < PT_MAX; id++) {
++		if (P.active & (1u << id)) {
++			sweet_hid_touch((int)id, 0, P.x[id], P.y[id]);
++		}
++	}
++	P.active = 0;
++}
++
++static void
++pt_coord(const uint8_t *e)
++{
++	unsigned action = (unsigned)(e[0] >> 6), tid = (unsigned)((e[0] >> 2) & 15u);
++	unsigned ttype = (unsigned)(((e[6] >> 6) << 2) | (e[7] >> 6));
++	int x = (int)(((unsigned)e[1] << 4) | ((unsigned)e[3] >> 4));
++	int y = (int)(((unsigned)e[2] << 4) | ((unsigned)e[3] & 15u));
++	if (tid < 1 || tid > PT_MAX) {
++		return;
++	}
++	unsigned id = tid - 1;
++	uint32_t bit = 1u << id;
++	if (x > 1079) {
++		x = 1079;
++	}
++	if (y > 2339) {
++		y = 2339;
++	}
++	bool finger = ttype == 0 || ttype == 3 || ttype == 6;	/* normal, glove, wet */
++	if (action == 3 || !finger) {
++		if (P.active & bit) {
++			sweet_hid_touch((int)id, 0, P.x[id], P.y[id]);
++			P.active &= ~bit;
++		}
++		return;
++	}
++	if (action == 1) {
++		P.npress++;
++	}
++	if (!(P.active & bit) || x != P.x[id] || y != P.y[id]) {
++		sweet_hid_touch((int)id, 1, x, y);
++	}
++	P.x[id] = x;
++	P.y[id] = y;
++	P.active |= bit;
++}
++
++static void
++pt_events(void)
++{
++	uint8_t all[8 * 16];
++	if (sec_read(0x60, all, 8)) {
++		return;
++	}
++	if (all[0] == 0) {
++		return;
++	}
++	unsigned left = all[7] & 0x3fu, cnt = 1;
++	if (left >= 16) {
++		(void)sec_write(0x62, NULL, 0);	/* clear event stack */
++		return;
++	}
++	if (left > 0 && !sec_read(0x61, all + 8, 8 * left)) {
++		cnt += left;
++	}
++	for (unsigned k = 0; k < cnt; k++) {
++		const uint8_t *e = all + 8 * k;
++		P.nevt++;
++		if ((e[0] & 3u) == 0) {
++			pt_coord(e);
++		}
++	}
++}
++
++/* ---- thread ---- */
++static void
++pt_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 20;
++	uint8_t ev[8];
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	printf("PIXEL TOUCH: starting in %u s\n", delay_s);
++	pt_wait(delay_s * 1000u);
++	P.gcc = ml_io_map(PT_GCC_PA, 0x60000);
++	P.se = ml_io_map(PT_SE0_PA, 0x4000);
++	P.gw = ml_io_map(PT_TLMM_W_PA, 0x10000);
++	P.ge = ml_io_map(PT_TLMM_E_PA, 0x30000);
++	P.rsc = ml_io_map(PT_RSC_PA, 0x100);
++	P.tcs = ml_io_map(PT_TCS_PA, PT_TCS_SIZE);
++	P.db = ml_io_map(PT_DB_PA, PT_DB_SIZE);
++	if (!P.gcc || !P.se || !P.gw || !P.ge || !P.rsc || !P.tcs || !P.db) {
++		printf("PIXEL TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	if (!pt_clocks()) {
++		goto out;
++	}
++	pt_se_init();
++	/* bus switch low (AP is master), reset held low, irq input, SPI pins */
++	pt_gpio(P.ge, 0x23000u, 0, 0, 0, true, false);
++	pt_gpio(P.gw, 0x8000u, 0, 0, 0, true, false);
++	pt_gpio(P.gw, 0x9000u, 0, 0, 0, false, false);
++	for (unsigned i = 0; i < 4; i++) {
++		pt_gpio(P.ge, 0x2a000u + i * 0x1000u, 1, 0, 2, false, false);
++	}
++	int e = pt_power_on();
++	if (e) {
++		printf("PIXEL TOUCH: power-on failed %d\n", e);
++		goto out;
++	}
++	pt_wait(20);
++	pt_gpio(P.gw, 0x8000u, 0, 0, 0, true, true);	/* release reset */
++	pt_wait(150);
++	bool ready = false;
++	for (unsigned tries = 0; tries < 100 && !ready; tries++) {
++		if (!sec_read(0x60, ev, 8) && ((ev[0] >> 2) & 0xfu) == 2 && ev[1] == 0) {
++			ready = true;
++			printf("PIXEL TOUCH: IC ready after %u tries, boot status %#x\n", tries, ev[2]);
++		} else {
++			pt_wait(20);
++		}
++	}
++	if (!ready) {
++		printf("PIXEL TOUCH: IC did not report boot complete (ok=%u fail=%u)\n", P.spi_ok, P.spi_fail);
++		goto out;
++	}
++	uint8_t id3[3] = {0, 0, 0};
++	(void)sec_read(0x52, id3, 3);
++	printf("PIXEL TOUCH: device id %02x %02x %02x\n", id3[0], id3[1], id3[2]);
++	uint8_t tf[2] = {0x61, 0x00};	/* touch | palm | wet */
++	(void)sec_write(0x30, tf, 2);
++	int se = sec_write(0x10, NULL, 0);	/* sense on */
++	printf("PIXEL TOUCH: sense on -> %d; polling\n", se);
++	unsigned tick = 0;
++	while (!P.dead) {
++		bool irq_low = !(pt_rd(P.gw, 0x9004u) & 1u);
++		if (irq_low) {
++			pt_events();
++		}
++		if ((++tick % 2000u) == 0) {
++			printf("PIXEL TOUCH: alive ok=%u fail=%u events=%u presses=%u\n", P.spi_ok, P.spi_fail, P.nevt, P.npress);
++		}
++		pt_wait(5);
++	}
++	pt_release_all();
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++pixel_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (P.started) {
++		return;
++	}
++	P.started = true;
++	(void)PE_parse_boot_argn("pixeltouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("PIXEL TOUCH: disabled (pixeltouch=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(pt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("PIXEL TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
