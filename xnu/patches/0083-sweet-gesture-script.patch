@@ -1,0 +1,174 @@
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -348,6 +348,7 @@
+  * absolute digitizers.
+  */
+ #define SWEET_TOUCH_FINGERS 10
++extern "C" void sweet_hid_key(int key, int down);
+ /*
+  * Contacts that start this close to a panel edge (pixels, ~3 mm) carry
+  * kIOHIDDigitizerEventFromEdgeTip for their whole life, as Apple's touch
+@@ -361,11 +362,21 @@
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void touch(int finger, bool down, int x, int y);
++	void startScript(const char *spec);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
++	static void scriptFired(OSObject *owner, IOTimerEventSource *sender);
++	void scriptStep(IOTimerEventSource *sender);
++	struct ScriptStep {
++		char op;
++		int t, x1, y1, x2, y2;
++	};
++	ScriptStep fSteps[16];
++	int fNSteps, fCur, fStage;
++	IOTimerEventSource *fScript;
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+@@ -445,9 +456,141 @@
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
++	{
++		char spec[200];
++		if (PE_parse_boot_argn("sweetgest", spec, sizeof(spec))) {
++			startScript(spec);
++		}
++	}
+ 	return true;
+ }
+ 
++static const char *
++sweetScriptNum(const char *p, int *out)
++{
++	int v = 0;
++	bool any = false;
++
++	while (*p >= '0' && *p <= '9') {
++		v = v * 10 + (*p - '0');
++		p++;
++		any = true;
++	}
++	*out = v;
++	return any ? p : NULL;
++}
++
++void
++SweetHIDTouch::startScript(const char *spec)
++{
++	const char *p = spec;
++
++	fNSteps = 0;
++	fCur = 0;
++	fStage = 0;
++	while (*p && fNSteps < 16) {
++		ScriptStep *s = &fSteps[fNSteps];
++		int v[5] = {0, 0, 0, 0, 0};
++		int need = 0;
++
++		s->op = *p++;
++		need = (s->op == 's') ? 5 : (s->op == 't') ? 3 : (s->op == 'h') ? 1 : -1;
++		if (need < 0) {
++			break;
++		}
++		bool ok = true;
++		for (int i = 0; i < need; i++) {
++			if (*p != ',') {
++				ok = false;
++				break;
++			}
++			p = sweetScriptNum(p + 1, &v[i]);
++			if (!p) {
++				ok = false;
++				break;
++			}
++		}
++		if (!ok) {
++			break;
++		}
++		s->t = v[0];
++		s->x1 = v[1];
++		s->y1 = v[2];
++		s->x2 = v[3];
++		s->y2 = v[4];
++		fNSteps++;
++		if (*p == '/') {
++			p++;
++		} else {
++			break;
++		}
++	}
++	IOLog("SWEET HID: gesture script has %d step(s)\n", fNSteps);
++	if (fNSteps == 0) {
++		return;
++	}
++	fScript = IOTimerEventSource::timerEventSource(this, &SweetHIDTouch::scriptFired);
++	if (fScript && _hidWorkLoop->addEventSource(fScript) == kIOReturnSuccess) {
++		fScript->setTimeoutMS((UInt32)fSteps[0].t * 1000);
++	}
++}
++
++void
++SweetHIDTouch::scriptFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	((SweetHIDTouch *)owner)->scriptStep(sender);
++}
++
++void
++SweetHIDTouch::scriptStep(IOTimerEventSource *sender)
++{
++	ScriptStep *s = &fSteps[fCur];
++	UInt32 delayMs = 50;
++	bool done = false;
++	const int N = 12;
++
++	if (s->op == 't') {
++		if (fStage == 0) {
++			touch(0, true, s->x1, s->y1);
++			delayMs = 120;
++			fStage = 1;
++		} else {
++			touch(0, false, s->x1, s->y1);
++			done = true;
++		}
++	} else if (s->op == 's') {
++		if (fStage == 0) {
++			touch(0, true, s->x1, s->y1);
++			fStage = 1;
++		} else if (fStage <= N) {
++			touch(0, true, s->x1 + (s->x2 - s->x1) * fStage / N, s->y1 + (s->y2 - s->y1) * fStage / N);
++			fStage++;
++		} else {
++			touch(0, false, s->x2, s->y2);
++			done = true;
++		}
++	} else {
++		if (fStage == 0) {
++			sweet_hid_key(3, 1);
++			delayMs = 100;
++			fStage = 1;
++		} else {
++			sweet_hid_key(3, 0);
++			done = true;
++		}
++	}
++	if (!done) {
++		sender->setTimeoutMS(delayMs);
++		return;
++	}
++	fStage = 0;
++	IOLog("SWEET HID: gesture step %d (%c) done\n", fCur, s->op);
++	if (++fCur < fNSteps) {
++		int gap = (fSteps[fCur].t - s->t) * 1000 - 1000;
++		sender->setTimeoutMS(gap > 500 ? (UInt32)gap : 500);
++	}
++}
++
+ void
+ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ {
