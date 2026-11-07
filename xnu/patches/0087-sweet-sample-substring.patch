@@ -1,0 +1,18 @@
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -33,8 +33,13 @@
+ 	for (const char *t = sweet_sample_names; *t;) {
+ 		const char *end = strchr(t, ',');
+ 		size_t tl = end ? (size_t)(end - t) : strlen(t);
+-		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
+-			return true;
++		/* substring match: token "migrat" selects every process whose name contains it */
++		if (tl > 0) {
++			for (size_t i = 0; i + tl <= n; i++) {
++				if (strncmp(name + i, t, tl) == 0) {
++					return true;
++				}
++			}
+ 		}
+ 		if (!end) {
+ 			break;
