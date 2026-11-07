@@ -1,0 +1,50 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -329,6 +329,29 @@
+  * to the panel memory is the slow part.
+  */
+ static uint64_t sweet_fb_bytes_written;
++/* The Pixel 5 panel wants the other colour order from iOS's BGRA: swap red and blue while copying
++ * (boot-arg sweetfb_swaprb=0 turns it off).  The shadow keeps the unswapped source for comparing. */
++static int sweet_fb_swaprb = -1;
++
++static void
++sweet_fb_copy(uint8_t *d, const uint8_t *s, size_t pixels)
++{
++	if (sweet_fb_swaprb < 0) {
++		int v = 1;
++		PE_parse_boot_argn("sweetfb_swaprb", &v, sizeof(v));
++		sweet_fb_swaprb = v != 0;
++	}
++	if (!sweet_fb_swaprb) {
++		memcpy(d, s, pixels * 4);
++		return;
++	}
++	volatile uint32_t *dd = (volatile uint32_t *)d;
++	for (size_t k = 0; k < pixels; k++) {
++		uint32_t p;
++		memcpy(&p, s + k * 4, 4);
++		dd[k] = (p & 0xff00ff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16);
++	}
++}
+ 
+ static void
+ sweet_fb_row(uint8_t *d, uint8_t *sh, const uint8_t *s, size_t w, bool full)
+@@ -351,7 +374,7 @@
+ 			j--;
+ 		}
+ 	}
+-	memcpy(d + i * 4, s + i * 4, (j - i) * 4);
++	sweet_fb_copy(d + i * 4, s + i * 4, j - i);
+ 	memcpy(sh + i * 4, s + i * 4, (j - i) * 4);
+ 	sweet_fb_bytes_written += (uint64_t)(j - i) * 4;
+ }
+@@ -447,7 +470,7 @@
+ 				const uint8_t *sp = (const uint8_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow +
+ 				    (uint64_t)sx * 4);
+ 				if (fShadow == NULL) {
+-					memcpy(d, sp, (size_t)w * 4);
++					sweet_fb_copy(d, sp, (size_t)w);
+ 					sweet_fb_bytes_written += (uint64_t)w * 4;
+ 					continue;
+ 				}
