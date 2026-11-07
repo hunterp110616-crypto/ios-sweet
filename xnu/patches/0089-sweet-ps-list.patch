@@ -1,0 +1,55 @@
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -65,6 +65,36 @@
+ 	return PROC_RETURNED;
+ }
+ 
++
++/* process list ("ps") lines: SMP ps: name[pid] name[pid] ... */
++static struct {
++	char buf[200];
++	size_t n;
++} sweet_ps;
++
++static int
++sweet_ps_cb(proc_t p, __unused void *arg)
++{
++	char name[40];
++	char item[64];
++	const char *nm = name;
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strncmp(nm, "com.apple.", 10) == 0) {
++		nm += 10;
++	}
++	int l = snprintf(item, sizeof(item), "%s[%d] ", nm, proc_pid(p));
++	if (l <= 0 || (size_t)l >= sizeof(item)) {
++		return PROC_RETURNED;
++	}
++	if (sweet_ps.n + (size_t)l >= sizeof(sweet_ps.buf)) {
++		printf("SMP ps: %s\n", sweet_ps.buf);
++		sweet_ps.n = 0;
++	}
++	memcpy(sweet_ps.buf + sweet_ps.n, item, (size_t)l + 1);
++	sweet_ps.n += (size_t)l;
++	return PROC_RETURNED;
++}
++
+ static void
+ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -78,6 +108,15 @@
+ 	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
++		if (i < 3) {
++			sweet_ps.n = 0;
++			sweet_ps.buf[0] = 0;
++			printf("SMP ps --- %d\n", i);
++			proc_iterate(PROC_ALLPROCLIST, sweet_ps_cb, NULL, NULL, NULL);
++			if (sweet_ps.n) {
++				printf("SMP ps: %s\n", sweet_ps.buf);
++			}
++		}
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+ 		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
+ 	}
