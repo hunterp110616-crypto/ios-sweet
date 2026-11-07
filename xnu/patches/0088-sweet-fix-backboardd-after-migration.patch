@@ -1,0 +1,78 @@
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -83,6 +83,67 @@
+ 	}
+ }
+ 
++
++/*
++ * sweetfixbb=1: after the data migration has finished, restart backboardd once (see patch 0088).
++ */
++static int
++sweet_fix_count_cb(proc_t p, void *arg)
++{
++	char name[40];
++	proc_name(proc_pid(p), name, sizeof(name));
++	size_t n = strlen(name);
++	for (size_t i = 0; i + 6 <= n; i++) {
++		if (strncmp(name + i, "migrat", 6) == 0) {
++			(*(int *)arg)++;
++			break;
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static int
++sweet_fix_kill_cb(proc_t p, void *arg)
++{
++	char name[40];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, "backboardd") == 0) {
++		printf("SWEET FIXBB: killing backboardd[%d]\n", proc_pid(p));
++		psignal(p, SIGKILL);
++		(*(int *)arg)++;
++	}
++	return PROC_RETURNED;
++}
++
++static void
++sweet_fixbb_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	int enabled = 0, seen = 0, gone = 0;
++	if (!PE_parse_boot_argn("sweetfixbb", &enabled, sizeof(enabled)) || !enabled) {
++		return;
++	}
++	for (int i = 0; i < 1500; i++) {		/* up to ~2 h at 5 s */
++		int n = 0;
++		(void)tsleep(&chan, PZERO, "sweetfix", 5 * hz);
++		proc_iterate(PROC_ALLPROCLIST, sweet_fix_count_cb, &n, NULL, NULL);
++		if (n) {
++			if (!seen) {
++				printf("SWEET FIXBB: migration process seen\n");
++			}
++			seen = 1;
++			gone = 0;
++		} else if (seen && ++gone >= 6) {
++			int killed = 0;
++			printf("SWEET FIXBB: migration finished, restarting backboardd in 20 s\n");
++			(void)tsleep(&chan, PZERO, "sweetfix", 20 * hz);
++			proc_iterate(PROC_ALLPROCLIST, sweet_fix_kill_cb, &killed, NULL, NULL);
++			printf("SWEET FIXBB: killed %d\n", killed);
++			return;
++		}
++	}
++}
++
+ void
+ sweet_sample_start(void)
+ {
+@@ -90,4 +151,7 @@
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (kernel_thread_start(sweet_fixbb_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
