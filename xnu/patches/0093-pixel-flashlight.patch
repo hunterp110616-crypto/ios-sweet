@@ -1,0 +1,137 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -23,12 +23,18 @@
+ #define KEYS_PON_RT      0x0810u
+ #define KEYS_GPIO_RT     0xc410u /* Pixel 5: PM8150L gpio5 (volume up), status register */
+ #define KEYS_NO_APID     0xffffu
++#define KEYS_CHNL_PA     0x0c600000u /* SPMI arbiter read/write channels (apid * 0x10000) */
++#define KEYS_FLASH_PPID  0x5d3      /* Pixel 5: PM8150L SID 5, periph 0xd3 = qpnp flash LED v2 */
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
++static uint16_t keys_flash_apid = KEYS_NO_APID;
++static vm_offset_t keys_flash_chnl;
++static bool torch_on, torch_chord_fired;
++static int torch_ma = 150, torch_chord_ms, torch_run_ms;
+ 
+ static uint32_t
+ keys_rd(vm_offset_t base, uint32_t off)
+@@ -81,6 +87,70 @@
+ 	return false;
+ }
+ 
++/*
++ * Pixel 5 flashlight (patch 0093). Only these writes touch the PMIC, and only the flash-LED peripheral
++ * (SID 5 / 0xd3): torch registers as in Google's leds-qpnp-flash-v2.c, EXT_WRITEL on the apid's own write channel.
++ */
++static bool
++keys_wr(uint16_t addr, uint8_t val)
++{
++	if (!keys_flash_chnl) {
++		return false;
++	}
++	*(volatile uint32_t *)(keys_flash_chnl + 0x10) = val;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(keys_flash_chnl + 0x00) = (uint32_t)(addr & 0xffu) << 4; /* EXT_WRITEL, one byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t st = keys_rd(keys_flash_chnl, 0x08);
++		if (st & 1u) {
++			return !(st & 0x0eu);
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++keys_wr_mask(uint16_t addr, uint8_t mask, uint8_t val)
++{
++	uint8_t cur = 0;
++	if (!keys_read(keys_flash_apid, addr, &cur)) {
++		return false;
++	}
++	return keys_wr(addr, (uint8_t)((cur & ~mask) | (val & mask)));
++}
++
++static void
++torch_set(bool on)
++{
++	bool ok = true;
++	if (on) {
++		int code = (torch_ma * 1000 + 6250) / 12500 - 1; /* 12.5 mA per step */
++		if (code < 0) {
++			code = 0;
++		} else if (code > 23) {
++			code = 23; /* 300 mA = Google's torch maximum */
++		}
++		for (int id = 0; id < 2; ++id) {
++			ok &= keys_wr_mask((uint16_t)(0x49 + id), 0x04, 0x00); /* software strobe */
++			ok &= keys_wr((uint16_t)(0x43 + id), (uint8_t)code);   /* TGR_CURRENT */
++			ok &= keys_wr((uint16_t)(0x40 + id), 0x13);            /* safety timer disabled */
++		}
++		ok &= keys_wr_mask(0x47, 0x7f, 0x00);  /* IRES 12.5 mA */
++		ok &= keys_wr_mask(0x46, 0x80, 0x80);  /* MOD_CTRL: module on */
++		delay(5000);
++		ok &= keys_wr_mask(0x4c, 0x03, 0x03);  /* EN_LED_CTRL: both LEDs */
++	} else {
++		ok &= keys_wr_mask(0x4c, 0x03, 0x00);
++		delay(10000);
++		ok &= keys_wr_mask(0x46, 0x80, 0x00);
++	}
++	torch_on = on && ok;
++	torch_run_ms = 0;
++	printf("SWEET TORCH: %s ma=%d ok=%d\n", on ? "on" : "off", torch_ma, ok);
++}
++
+ static void
+ keys_wait(void)
+ {
+@@ -118,6 +188,22 @@
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
++		if (keys_flash_chnl && state[1] && state[2]) {
++			torch_chord_ms += 20;
++			if (torch_chord_ms >= 600 && !torch_chord_fired) {
++				torch_chord_fired = true;
++				torch_set(!torch_on);
++			}
++		} else {
++			torch_chord_ms = 0;
++			torch_chord_fired = false;
++		}
++		if (torch_on) {
++			torch_run_ms += 20;
++			if (torch_run_ms > 300000) { /* 5 min safety */
++				torch_set(false);
++			}
++		}
+ 		keys_wait();
+ 	}
+ }
+@@ -172,6 +258,21 @@
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
++	{
++		int tma = 150;
++		(void)PE_parse_boot_argn("sweettorch", &tma, sizeof(tma));
++		if (tma > 0) {
++			keys_flash_apid = keys_find_apid(KEYS_FLASH_PPID, count);
++			uint8_t ftype = 0, fsub = 0;
++			bool fok = keys_read(keys_flash_apid, 0x04, &ftype) && keys_read(keys_flash_apid, 0x05, &fsub);
++			if (fok && ftype == 0x18 && fsub == 0x04) {
++				torch_ma = tma < 12 ? 12 : (tma > 300 ? 300 : tma);
++				keys_flash_chnl = ml_io_map(KEYS_CHNL_PA + 0x10000u * keys_flash_apid, 0x1000);
++			}
++			printf("SWEET TORCH: apid=%u type=%#x sub=%#x ok=%d chnl=%d ma=%d (Vol Up + Vol Down 0.6 s toggles)\n",
++			    keys_flash_apid, ftype, fsub, fok, keys_flash_chnl != 0, torch_ma);
++		}
++	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
