@@ -18,6 +18,10 @@ jobs:
           xcrun --sdk iphoneos clang -isysroot "$SDK" -arch arm64 -miphoneos-version-min=16.0 \
             -fobjc-arc -Wall -Wno-unused-function -framework Foundation -framework MobileCoreServices \
             sweet-lsrebuild.m -o sweet-lsrebuild
+          xcrun --sdk iphoneos clang -isysroot "$SDK" -arch arm64 -miphoneos-version-min=16.0 -fobjc-arc -Os -Wall -Wno-unused-function -framework Foundation -framework MobileCoreServices sweet-regplugins.m -o sweet-regplugins
+          strip -x sweet-regplugins || true
+          codesign -f -s - --entitlements ent.plist sweet-regplugins
+          ls -l sweet-lsrebuild sweet-regplugins
           codesign -f -s - --entitlements ent.plist sweet-lsrebuild
           file sweet-lsrebuild
           codesign -d --entitlements - sweet-lsrebuild | head -40 || true
@@ -25,4 +29,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: sweet-lsrebuild
-          path: lsrebuild/sweet-lsrebuild
+          path: |
+            lsrebuild/sweet-lsrebuild
+            lsrebuild/sweet-regplugins
