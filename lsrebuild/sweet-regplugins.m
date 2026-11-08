@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dispatch/dispatch.h>
+#include <objc/message.h>
 
 @interface LSApplicationWorkspace : NSObject
 + (instancetype)defaultWorkspace;
@@ -35,13 +36,19 @@ static int queryProviders(void) {
 	__block int n = -1;
 	dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 	@try {
-		[NSExtension extensionsWithMatchingAttributes:@{@"NSExtensionPointIdentifier": kPoster}
-										   completion:^(NSArray *exts, NSError *err) {
+		Class ec = NSClassFromString(@"NSExtension");
+		SEL es = NSSelectorFromString(@"extensionsWithMatchingAttributes:completion:");
+		if (!ec || ![ec respondsToSelector:es]) {
+			say("    NSExtension query API missing");
+			return -4;
+		}
+		void (*send)(id, SEL, NSDictionary *, void (^)(NSArray *, NSError *)) = (void *)objc_msgSend;
+		send(ec, es, @{@"NSExtensionPointIdentifier": kPoster}, ^(NSArray *exts, NSError *err) {
 			n = (int)[exts count];
 			for (id e in exts) say("    provider: %s", [[e description] UTF8String]);
 			if (err) say("    query error: %s", [[err description] UTF8String]);
 			dispatch_semaphore_signal(sem);
-		}];
+		});
 	} @catch (NSException *ex) {
 		say("    query exception: %s", [[ex description] UTF8String]);
 		return -2;
