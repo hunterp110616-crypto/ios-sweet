@@ -1,0 +1,28 @@
+name: lsrebuild
+on:
+  push:
+    paths:
+      - 'lsrebuild/**'
+      - '.github/workflows/lsrebuild.yml'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sweet-lsrebuild (iOS arm64, ad-hoc signed with entitlements)
+        run: |
+          set -e
+          cd lsrebuild
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -isysroot "$SDK" -arch arm64 -miphoneos-version-min=16.0 \
+            -fobjc-arc -Wall -Wno-unused-function -framework Foundation -framework MobileCoreServices \
+            sweet-lsrebuild.m -o sweet-lsrebuild
+          codesign -f -s - --entitlements ent.plist sweet-lsrebuild
+          file sweet-lsrebuild
+          codesign -d --entitlements - sweet-lsrebuild | head -40 || true
+          shasum -a 256 sweet-lsrebuild
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-lsrebuild
+          path: lsrebuild/sweet-lsrebuild
