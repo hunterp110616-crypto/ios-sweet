@@ -21,7 +21,10 @@ jobs:
           xcrun --sdk iphoneos clang -isysroot "$SDK" -arch arm64 -miphoneos-version-min=16.0 -fobjc-arc -Os -Wall -Wno-unused-function -framework Foundation -framework MobileCoreServices sweet-regplugins.m -o sweet-regplugins
           strip -x sweet-regplugins || true
           (brew install ldid >/dev/null 2>&1 && ldid -Sent.plist sweet-regplugins) || codesign -f -s - --entitlements ent.plist sweet-regplugins
-          ls -l sweet-lsrebuild sweet-regplugins
+          xcrun --sdk iphoneos clang -isysroot "$SDK" -arch arm64 -miphoneos-version-min=16.0 -fobjc-arc -Os -Wall -Wno-unused-function -framework Foundation -framework MobileCoreServices sweet-lsrebuild2.m -o sweet-lsrebuild2
+          strip -x sweet-lsrebuild2 || true
+          (command -v ldid >/dev/null 2>&1 && ldid -Sent.plist sweet-lsrebuild2) || codesign -f -s - --entitlements ent.plist sweet-lsrebuild2
+          ls -l sweet-lsrebuild sweet-regplugins sweet-lsrebuild2
           codesign -f -s - --entitlements ent.plist sweet-lsrebuild
           file sweet-lsrebuild
           codesign -d --entitlements - sweet-lsrebuild | head -40 || true
@@ -32,3 +35,4 @@ jobs:
           path: |
             lsrebuild/sweet-lsrebuild
             lsrebuild/sweet-regplugins
+            lsrebuild/sweet-lsrebuild2
