@@ -52,7 +52,7 @@ static void try_one(const char *label, uint32_t cls, const char *ident, int pers
 	q_free(q);
 }
 
-static void round(int n) {
+static void do_round(int n) {
 	say("---- round %d ----", n);
 	try_one("exact-init", 10, "com.apple.installd", 1, 0x900000001ULL);
 	try_one("no-persona", 10, "com.apple.installd", 0, 0x900000001ULL);
@@ -79,7 +79,7 @@ int main(int argc, char **argv) {
 			q_create, q_class, q_ids, q_persona, q_flags, q_single, q_lasterr, e_desc, c_path, q_free);
 		if (!q_create || !q_class || !q_ids || !q_single || !q_free) { say("missing symbols, exiting"); return 0; }
 		sleep(90);
-		round(1);
+		do_round(1);
 		// the real thing, in a child so its abort() doesn't kill us
 		pid_t p = fork();
 		if (p == 0) {
@@ -94,7 +94,7 @@ int main(int argc, char **argv) {
 				st, WIFEXITED(st), WEXITSTATUS(st), WIFSIGNALED(st), WTERMSIG(st));
 		}
 		sleep(60);
-		round(2);
+		do_round(2);
 		say("done");
 	}
 	return 0;
