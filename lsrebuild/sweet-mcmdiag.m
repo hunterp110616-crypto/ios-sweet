@@ -2,6 +2,7 @@
 // "com.apple.installd" and log the exact MCM error. Logs to /var/mobile/Library/Logs/sweet-mcmdiag.log.
 #import <Foundation/Foundation.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -9,6 +10,10 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <spawn.h>
+#include <pwd.h>
+#include <grp.h>
+extern char **environ;
 #include <xpc/xpc.h>
 
 static FILE *lf;
@@ -63,10 +68,27 @@ static void do_round(int n) {
 	try_one("mobile-installation", 10, "com.apple.mobile_installation", 0, 0);
 }
 
+static void run_child(const char *self, const char *label) {
+	char *args[] = { (char *)self, (char *)"child", NULL };
+	pid_t p = 0;
+	int rc = posix_spawn(&p, self, NULL, NULL, args, environ);
+	if (rc != 0) { say("%s: posix_spawn failed rc=%d", label, rc); return; }
+	int st = 0; waitpid(p, &st, 0);
+	say("%s: real MIDaemonConfiguration sharedInstance in exec'd child (uid %d): status=%#x exited=%d code=%d signaled=%d sig=%d",
+		label, getuid(), st, WIFEXITED(st), WEXITSTATUS(st), WIFSIGNALED(st), WTERMSIG(st));
+}
+
 int main(int argc, char **argv) {
 	@autoreleasepool {
+		if (argc > 1 && !strcmp(argv[1], "child")) {
+			dlopen("/System/Library/PrivateFrameworks/InstalledContentLibrary.framework/InstalledContentLibrary", RTLD_NOW);
+			Class c = NSClassFromString(@"MIDaemonConfiguration");
+			if (!c) _exit(90);
+			[c performSelector:NSSelectorFromString(@"sharedInstance")];
+			_exit(0);
+		}
 		mkdir("/var/mobile/Library/Logs", 0755);
-		lf = fopen("/var/mobile/Library/Logs/sweet-mcmdiag.log", "a");
+		lf = fopen("/var/mobile/Library/Logs/sweet-mcmdiag2.log", "a");
 		if (!lf) lf = stderr;
 		say("start pid=%d uid=%d", getpid(), getuid());
 		void *h = RTLD_DEFAULT;
@@ -75,25 +97,18 @@ int main(int argc, char **argv) {
 		q_flags = dlsym(h, "container_query_operation_set_flags"); q_single = dlsym(h, "container_query_get_single_result");
 		q_lasterr = dlsym(h, "container_query_get_last_error"); e_desc = dlsym(h, "container_error_copy_unlocalized_description");
 		c_path = dlsym(h, "container_get_path"); q_free = dlsym(h, "container_query_free");
-		say("syms create=%p class=%p ids=%p persona=%p flags=%p single=%p lasterr=%p desc=%p path=%p free=%p",
-			q_create, q_class, q_ids, q_persona, q_flags, q_single, q_lasterr, e_desc, c_path, q_free);
 		if (!q_create || !q_class || !q_ids || !q_single || !q_free) { say("missing symbols, exiting"); return 0; }
 		sleep(90);
+		say("==== as root ====");
+		try_one("root exact-init", 10, "com.apple.installd", 1, 0x900000001ULL);
+		run_child(argv[0], "root");
+		struct passwd *pw = getpwnam("mobile");
+		uid_t mu = pw ? pw->pw_uid : 501; gid_t mg = pw ? pw->pw_gid : 501;
+		int r1 = initgroups("mobile", mg), r2 = setgid(mg), r3 = setuid(mu);
+		say("==== dropped to mobile: initgroups=%d setgid=%d setuid=%d now uid=%d euid=%d ====", r1, r2, r3, getuid(), geteuid());
 		do_round(1);
-		// the real thing, in a child so its abort() doesn't kill us
-		pid_t p = fork();
-		if (p == 0) {
-			void *lib = dlopen("/System/Library/PrivateFrameworks/InstalledContentLibrary.framework/InstalledContentLibrary", RTLD_NOW);
-			Class c = NSClassFromString(@"MIDaemonConfiguration");
-			if (!c) _exit(90);
-			[c performSelector:NSSelectorFromString(@"sharedInstance")];
-			(void)lib; _exit(0);
-		} else if (p > 0) {
-			int st = 0; waitpid(p, &st, 0);
-			say("real MIDaemonConfiguration sharedInstance in child: status=%#x exited=%d code=%d signaled=%d sig=%d",
-				st, WIFEXITED(st), WEXITSTATUS(st), WIFSIGNALED(st), WTERMSIG(st));
-		}
-		sleep(60);
+		run_child(argv[0], "mobile");
+		sleep(30);
 		do_round(2);
 		say("done");
 	}
