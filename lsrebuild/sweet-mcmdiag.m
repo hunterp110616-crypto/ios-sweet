@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
 			_exit(0);
 		}
 		mkdir("/var/mobile/Library/Logs", 0755);
-		lf = fopen("/var/mobile/Library/Logs/sweet-mcmdiag2.log", "a");
+		lf = fopen("/var/mobile/Library/Logs/sweet-mcmdiag3.log", "a");
 		if (!lf) lf = stderr;
 		say("start pid=%d uid=%d", getpid(), getuid());
 		void *h = RTLD_DEFAULT;

@@ -26,7 +26,7 @@ jobs:
           (command -v ldid >/dev/null 2>&1 && ldid -Sent.plist sweet-lsrebuild2) || codesign -f -s - --entitlements ent.plist sweet-lsrebuild2
           xcrun --sdk iphoneos clang -isysroot "$SDK" -arch arm64 -miphoneos-version-min=16.0 -fobjc-arc -Os -Wall -Wno-unused-function -framework Foundation sweet-mcmdiag.m -o sweet-mcmdiag
           strip -x sweet-mcmdiag || true
-          (command -v ldid >/dev/null 2>&1 && ldid -Sent_diag.plist sweet-mcmdiag) || codesign -f -s - --entitlements ent_diag.plist sweet-mcmdiag
+          (command -v ldid >/dev/null 2>&1 && ldid -Sent_lsd.plist sweet-mcmdiag) || codesign -f -s - --entitlements ent_lsd.plist sweet-mcmdiag
           ls -l sweet-lsrebuild sweet-regplugins sweet-lsrebuild2 sweet-mcmdiag
           codesign -f -s - --entitlements ent.plist sweet-lsrebuild
           file sweet-lsrebuild
